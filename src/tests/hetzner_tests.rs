@@ -12,8 +12,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        DnsRecord, DnsRecordType, Error, MXRecord, TLSARecord, TlsaCertUsage, TlsaMatching,
-        TlsaSelector, providers::hetzner::HetznerProvider,
+        CAARecord, DnsRecord, DnsRecordType, Error, KeyValue, MXRecord, TLSARecord, TlsaCertUsage,
+        TlsaMatching, TlsaSelector, providers::hetzner::HetznerProvider,
     };
     use mockito::Matcher;
     use serde_json::json;
@@ -795,6 +795,85 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             vec![DnsRecord::TXT("hello world".to_string())]
+        );
+        list.assert();
+    }
+
+    #[tokio::test]
+    async fn test_list_rrset_parses_chunked_txt_with_escapes() {
+        let mut server = mockito::Server::new_async().await;
+        let list = server
+            .mock("GET", "/zones/example.com/rrsets")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("name".into(), "_domainkey".into()),
+                Matcher::UrlEncoded("type".into(), "TXT".into()),
+                Matcher::UrlEncoded("per_page".into(), "50".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"rrsets":[{"id":"_domainkey/TXT","name":"_domainkey","type":"TXT","ttl":300,"records":[{"value":"\"first \\\"quoted\\\"\" \"second \\\\part\""}]}],"meta":{}}"#,
+            )
+            .create();
+
+        let provider = setup_provider(server.url());
+        let result = provider
+            .list_rrset("_domainkey.example.com", DnsRecordType::TXT, "example.com")
+            .await;
+
+        assert!(result.is_ok(), "list_rrset returned: {result:?}");
+        assert_eq!(
+            result.unwrap(),
+            vec![DnsRecord::TXT(r#"first "quoted"second \part"#.to_string())]
+        );
+        list.assert();
+    }
+
+    #[tokio::test]
+    async fn test_list_rrset_parses_caa_variants() {
+        let mut server = mockito::Server::new_async().await;
+        let list = server
+            .mock("GET", "/zones/example.com/rrsets")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("name".into(), "@".into()),
+                Matcher::UrlEncoded("type".into(), "CAA".into()),
+                Matcher::UrlEncoded("per_page".into(), "50".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"rrsets":[{"id":"@/CAA","name":"@","type":"CAA","ttl":300,"records":[{"value":"0 issue \"letsencrypt.org; validationmethods=dns-01\""},{"value":"128 issuewild \"sectigo.com; account=1234\""},{"value":"0 iodef \"mailto:security@example.com\""}]}],"meta":{}}"#,
+            )
+            .create();
+
+        let provider = setup_provider(server.url());
+        let result = provider
+            .list_rrset("example.com", DnsRecordType::CAA, "example.com")
+            .await;
+
+        assert!(result.is_ok(), "list_rrset returned: {result:?}");
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                DnsRecord::CAA(CAARecord::Issue {
+                    issuer_critical: false,
+                    name: Some("letsencrypt.org".to_string()),
+                    options: vec![KeyValue {
+                        key: "validationmethods".to_string(),
+                        value: "dns-01".to_string(),
+                    }],
+                }),
+                DnsRecord::CAA(CAARecord::IssueWild {
+                    issuer_critical: true,
+                    name: Some("sectigo.com".to_string()),
+                    options: vec![KeyValue {
+                        key: "account".to_string(),
+                        value: "1234".to_string(),
+                    }],
+                }),
+                DnsRecord::CAA(CAARecord::Iodef {
+                    issuer_critical: false,
+                    url: "mailto:security@example.com".to_string(),
+                }),
+            ]
         );
         list.assert();
     }
