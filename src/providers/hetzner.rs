@@ -101,8 +101,15 @@ impl HetznerProvider {
         let domain = origin.into_name();
         let subdomain = strip_origin_from_name(&name, &domain, Some("@"));
         let values = build_values(record_type, records)?;
-        self.upsert_records(&domain, &subdomain, record_type, ttl, values, UpsertMode::Replace)
-            .await
+        self.upsert_records(
+            &domain,
+            &subdomain,
+            record_type,
+            ttl,
+            values,
+            UpsertMode::Replace,
+        )
+        .await
     }
 
     pub(crate) async fn add_to_rrset(
@@ -117,8 +124,15 @@ impl HetznerProvider {
         let domain = origin.into_name();
         let subdomain = strip_origin_from_name(&name, &domain, Some("@"));
         let values = build_values(record_type, records)?;
-        self.upsert_records(&domain, &subdomain, record_type, ttl, values, UpsertMode::Append)
-            .await
+        self.upsert_records(
+            &domain,
+            &subdomain,
+            record_type,
+            ttl,
+            values,
+            UpsertMode::Append,
+        )
+        .await
     }
 
     pub(crate) async fn remove_from_rrset(
@@ -346,7 +360,10 @@ impl HetznerProvider {
         record_type: DnsRecordType,
         action: &str,
     ) -> String {
-        format!("{}/actions/{action}", self.rrset_url(domain, subdomain, record_type))
+        format!(
+            "{}/actions/{action}",
+            self.rrset_url(domain, subdomain, record_type)
+        )
     }
 }
 
