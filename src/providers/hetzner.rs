@@ -9,13 +9,13 @@
  * except according to those terms.
  */
 
-use crate::utils::split_caa_value;
-use crate::utils::strip_trailing_dot;
-use crate::utils::{parse_mx, parse_srv};
 use crate::{
-    CAARecord, DnsRecord, DnsRecordType, Error, IntoFqdn,
+    DnsRecord, DnsRecordType, Error, IntoFqdn,
     http::{HttpClient, HttpClientBuilder},
-    utils::{strip_origin_from_name, txt_chunks_to_text},
+    utils::{
+        build_caa, parse_mx, parse_srv, parse_tlsa, strip_origin_from_name, strip_trailing_dot,
+        txt_chunks_to_text, unquote_txt,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{net::AddrParseError, time::Duration};
@@ -27,27 +27,13 @@ pub struct HetznerProvider {
 }
 
 #[derive(Serialize, Debug)]
-struct SetRecordsBody {
-    records: Vec<RecordValue>,
-}
-
-#[derive(Serialize, Debug)]
-struct RemoveRecordsBody {
+struct RecordsBody {
     records: Vec<RecordValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct RecordValue {
     value: String,
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct ActionResponse {
-    #[serde(default)]
-    action: Option<serde_json::Value>,
-    #[serde(default)]
-    rrset: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -66,6 +52,11 @@ struct ListedRRSet {
 
 const DEFAULT_API_ENDPOINT: &str = "https://api.hetzner.cloud/v1";
 const RETRIES: u32 = 3;
+
+enum UpsertMode {
+    Replace,
+    Append,
+}
 
 impl HetznerProvider {
     pub(crate) fn new(
@@ -106,28 +97,12 @@ impl HetznerProvider {
         records: Vec<DnsRecord>,
         origin: impl IntoFqdn<'_>,
     ) -> crate::Result<()> {
-        check_record_types(record_type, &records)?;
         let name = name.into_name();
         let domain = origin.into_name();
         let subdomain = strip_origin_from_name(&name, &domain, Some("@"));
-
-        if records.is_empty() {
-            return self.delete_rrset(&domain, &subdomain, record_type).await;
-        }
-
-        let values = build_values(records)?;
-
-        match self
-            .post_set_records(&domain, &subdomain, record_type, &values)
+        let values = build_values(record_type, records)?;
+        self.upsert_records(&domain, &subdomain, record_type, ttl, values, UpsertMode::Replace)
             .await
-        {
-            Ok(_) => self.change_ttl(&domain, &subdomain, record_type, ttl).await,
-            Err(Error::NotFound) => {
-                self.add_records_then_change_ttl(&domain, &subdomain, record_type, ttl, values)
-                    .await
-            }
-            Err(e) => Err(e),
-        }
     }
 
     pub(crate) async fn add_to_rrset(
@@ -138,26 +113,12 @@ impl HetznerProvider {
         records: Vec<DnsRecord>,
         origin: impl IntoFqdn<'_>,
     ) -> crate::Result<()> {
-        check_record_types(record_type, &records)?;
-        if records.is_empty() {
-            return Ok(());
-        }
         let name = name.into_name();
         let domain = origin.into_name();
         let subdomain = strip_origin_from_name(&name, &domain, Some("@"));
-        let values = build_values(records)?;
-
-        match self
-            .post_add_records(&domain, &subdomain, record_type, &values)
+        let values = build_values(record_type, records)?;
+        self.upsert_records(&domain, &subdomain, record_type, ttl, values, UpsertMode::Append)
             .await
-        {
-            Ok(_) => self.change_ttl(&domain, &subdomain, record_type, ttl).await,
-            Err(Error::NotFound) => {
-                self.set_records_then_change_ttl(&domain, &subdomain, record_type, ttl, values)
-                    .await
-            }
-            Err(e) => Err(e),
-        }
     }
 
     pub(crate) async fn remove_from_rrset(
@@ -167,28 +128,21 @@ impl HetznerProvider {
         records: Vec<DnsRecord>,
         origin: impl IntoFqdn<'_>,
     ) -> crate::Result<()> {
-        check_record_types(record_type, &records)?;
-        if records.is_empty() {
-            return Ok(());
-        }
         let name = name.into_name();
         let domain = origin.into_name();
         let subdomain = strip_origin_from_name(&name, &domain, Some("@"));
-        let values = build_values(records)?;
+        let values = build_values(record_type, records)?;
+        if values.is_empty() {
+            return Ok(());
+        }
 
-        let url = format!(
-            "{}/zones/{}/rrsets/{}/{}/actions/remove_records",
-            self.endpoint,
-            domain,
-            subdomain,
-            record_type.as_str(),
-        );
+        let url = self.action_url(&domain, &subdomain, record_type, "remove_records");
 
         match self
             .client
             .post(url)
-            .with_body(RemoveRecordsBody { records: values })?
-            .send_with_retry::<ActionResponse>(RETRIES)
+            .with_body(RecordsBody { records: values })?
+            .send_with_retry::<serde_json::Value>(RETRIES)
             .await
         {
             Ok(_) => Ok(()),
@@ -236,6 +190,49 @@ impl HetznerProvider {
         Ok(out)
     }
 
+    async fn upsert_records(
+        &self,
+        domain: &str,
+        subdomain: &str,
+        record_type: DnsRecordType,
+        ttl: u32,
+        values: Vec<RecordValue>,
+        mode: UpsertMode,
+    ) -> crate::Result<()> {
+        if values.is_empty() {
+            return match mode {
+                UpsertMode::Replace => self.delete_rrset(domain, subdomain, record_type).await,
+                UpsertMode::Append => Ok(()),
+            };
+        }
+
+        let primary = match mode {
+            UpsertMode::Replace => {
+                self.post_set_records(domain, subdomain, record_type, &values)
+                    .await
+            }
+            UpsertMode::Append => {
+                self.post_add_records(domain, subdomain, record_type, &values)
+                    .await
+            }
+        };
+
+        match primary {
+            Ok(_) => self.change_ttl(domain, subdomain, record_type, ttl).await,
+            Err(Error::NotFound) => match mode {
+                UpsertMode::Replace => {
+                    self.add_records_then_change_ttl(domain, subdomain, record_type, ttl, values)
+                        .await
+                }
+                UpsertMode::Append => {
+                    self.set_records_then_change_ttl(domain, subdomain, record_type, ttl, values)
+                        .await
+                }
+            },
+            Err(e) => Err(e),
+        }
+    }
+
     async fn post_set_records(
         &self,
         domain: &str,
@@ -243,20 +240,12 @@ impl HetznerProvider {
         record_type: DnsRecordType,
         values: &[RecordValue],
     ) -> crate::Result<()> {
-        let url = format!(
-            "{}/zones/{}/rrsets/{}/{}/actions/set_records",
-            self.endpoint,
-            domain,
-            subdomain,
-            record_type.as_str(),
-        );
-
         self.client
-            .post(url)
-            .with_body(SetRecordsBody {
+            .post(self.action_url(domain, subdomain, record_type, "set_records"))
+            .with_body(RecordsBody {
                 records: values.to_vec(),
             })?
-            .send_with_retry::<ActionResponse>(RETRIES)
+            .send_with_retry::<serde_json::Value>(RETRIES)
             .await
             .map(|_| ())
     }
@@ -268,20 +257,12 @@ impl HetznerProvider {
         record_type: DnsRecordType,
         values: &[RecordValue],
     ) -> crate::Result<()> {
-        let url = format!(
-            "{}/zones/{}/rrsets/{}/{}/actions/add_records",
-            self.endpoint,
-            domain,
-            subdomain,
-            record_type.as_str(),
-        );
-
         self.client
-            .post(url)
-            .with_body(SetRecordsBody {
+            .post(self.action_url(domain, subdomain, record_type, "add_records"))
+            .with_body(RecordsBody {
                 records: values.to_vec(),
             })?
-            .send_with_retry::<ActionResponse>(RETRIES)
+            .send_with_retry::<serde_json::Value>(RETRIES)
             .await
             .map(|_| ())
     }
@@ -320,13 +301,7 @@ impl HetznerProvider {
     ) -> crate::Result<()> {
         match self
             .client
-            .delete(format!(
-                "{}/zones/{}/rrsets/{}/{}",
-                self.endpoint,
-                domain,
-                subdomain,
-                record_type.as_str(),
-            ))
+            .delete(self.rrset_url(domain, subdomain, record_type))
             .send_raw()
             .await
         {
@@ -348,52 +323,59 @@ impl HetznerProvider {
             ttl: u32,
         }
 
-        let url = format!(
-            "{}/zones/{}/rrsets/{}/{}/actions/change_ttl",
-            self.endpoint,
-            domain,
-            subdomain,
-            record_type.as_str(),
-        );
-
         self.client
-            .post(url)
+            .post(self.action_url(domain, subdomain, record_type, "change_ttl"))
             .with_body(ChangeTtl { ttl })?
-            .send_with_retry::<ActionResponse>(RETRIES)
+            .send_with_retry::<serde_json::Value>(RETRIES)
             .await
             .map(|_| ())
     }
+
+    fn rrset_url(&self, domain: &str, subdomain: &str, record_type: DnsRecordType) -> String {
+        format!(
+            "{}/zones/{domain}/rrsets/{subdomain}/{}",
+            self.endpoint,
+            record_type.as_str()
+        )
+    }
+
+    fn action_url(
+        &self,
+        domain: &str,
+        subdomain: &str,
+        record_type: DnsRecordType,
+        action: &str,
+    ) -> String {
+        format!("{}/actions/{action}", self.rrset_url(domain, subdomain, record_type))
+    }
 }
 
-fn check_record_types(expected: DnsRecordType, records: &[DnsRecord]) -> crate::Result<()> {
-    for r in records {
-        if r.as_type() != expected {
+fn build_values(
+    expected: DnsRecordType,
+    records: Vec<DnsRecord>,
+) -> crate::Result<Vec<RecordValue>> {
+    let mut out = Vec::with_capacity(records.len());
+    for record in records {
+        if record.as_type() != expected {
             return Err(Error::Api(format!(
                 "RRSet record type mismatch: expected {}, got {}",
                 expected.as_str(),
-                r.as_type().as_str(),
+                record.as_type().as_str(),
             )));
         }
-    }
-    Ok(())
-}
-
-fn build_values(records: Vec<DnsRecord>) -> crate::Result<Vec<RecordValue>> {
-    let mut out = Vec::with_capacity(records.len());
-    for record in records {
         out.push(RecordValue {
-            value: render_value(record)?,
+            value: render_value(record),
         });
     }
     Ok(out)
 }
 
-fn render_value(record: DnsRecord) -> crate::Result<String> {
-    Ok(match record {
-        DnsRecord::A(addr) => addr.to_string(),
-        DnsRecord::AAAA(addr) => addr.to_string(),
-        DnsRecord::CNAME(content) => content.into_fqdn().into_owned(),
-        DnsRecord::NS(content) => content.into_fqdn().into_owned(),
+fn render_value(record: DnsRecord) -> String {
+    match record {
+        DnsRecord::A(_) | DnsRecord::AAAA(_) | DnsRecord::TLSA(_) | DnsRecord::CAA(_) => {
+            record.to_string()
+        }
+        DnsRecord::CNAME(content) | DnsRecord::NS(content) => content.into_fqdn().into_owned(),
         DnsRecord::MX(mx) => format!("{} {}", mx.priority, mx.exchange.into_fqdn().into_owned()),
         DnsRecord::TXT(content) => {
             let mut out = String::with_capacity(content.len() + 4);
@@ -407,9 +389,7 @@ fn render_value(record: DnsRecord) -> crate::Result<String> {
             srv.port,
             srv.target.into_fqdn().into_owned(),
         ),
-        DnsRecord::TLSA(tlsa) => tlsa.to_string(),
-        DnsRecord::CAA(caa) => caa.to_string(),
-    })
+    }
 }
 
 fn parse_value(record_type: DnsRecordType, value: &str) -> crate::Result<DnsRecord> {
@@ -423,40 +403,11 @@ fn parse_value(record_type: DnsRecordType, value: &str) -> crate::Result<DnsReco
         DnsRecordType::CNAME => DnsRecord::CNAME(strip_trailing_dot(value).to_string()),
         DnsRecordType::NS => DnsRecord::NS(strip_trailing_dot(value).to_string()),
         DnsRecordType::MX => parse_mx(value)?,
-        DnsRecordType::TXT => DnsRecord::TXT(parse_txt(value)),
+        DnsRecordType::TXT => DnsRecord::TXT(unquote_txt(value)),
         DnsRecordType::SRV => parse_srv(value)?,
         DnsRecordType::TLSA => parse_tlsa(value)?,
         DnsRecordType::CAA => parse_caa(value)?,
     })
-}
-
-fn parse_txt(value: &str) -> String {
-    let trimmed = value.trim();
-    let mut out = String::with_capacity(trimmed.len());
-    let mut bytes = trimmed.bytes().peekable();
-    while let Some(&b) = bytes.peek() {
-        if b != b'"' {
-            bytes.next();
-            continue;
-        }
-        bytes.next();
-        loop {
-            match bytes.next() {
-                Some(b'"') => break,
-                Some(b'\\') => {
-                    if let Some(next) = bytes.next() {
-                        out.push(next as char);
-                    }
-                }
-                Some(other) => out.push(other as char),
-                None => break,
-            }
-        }
-    }
-    if out.is_empty() && !trimmed.is_empty() && !trimmed.starts_with('"') {
-        return trimmed.to_string();
-    }
-    out
 }
 
 fn parse_caa(value: &str) -> crate::Result<DnsRecord> {
@@ -474,34 +425,10 @@ fn parse_caa(value: &str) -> crate::Result<DnsRecord> {
         .next()
         .ok_or_else(|| Error::Parse(format!("invalid CAA value '{value}'")))?
         .trim();
-    let unquoted = raw_value
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .map(|s| s.replace("\\\"", "\""))
-        .unwrap_or_else(|| raw_value.to_string());
 
-    let issuer_critical = flags & 0x80 != 0;
-    match tag.as_str() {
-        "issue" => {
-            let (name, options) = split_caa_value(&unquoted);
-            Ok(DnsRecord::CAA(CAARecord::Issue {
-                issuer_critical,
-                name,
-                options,
-            }))
-        }
-        "issuewild" => {
-            let (name, options) = split_caa_value(&unquoted);
-            Ok(DnsRecord::CAA(CAARecord::IssueWild {
-                issuer_critical,
-                name,
-                options,
-            }))
-        }
-        "iodef" => Ok(DnsRecord::CAA(CAARecord::Iodef {
-            issuer_critical,
-            url: unquoted,
-        })),
-        other => Err(Error::Parse(format!("unknown CAA tag: {other}"))),
-    }
+    Ok(DnsRecord::CAA(build_caa(
+        flags,
+        &tag,
+        &unquote_txt(raw_value),
+    )?))
 }
